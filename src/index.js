@@ -1,64 +1,71 @@
 export default {
-  async fetch(req, env, ctx) {
-    const url = new URL(req.url);
+  async fetch(req) {
+    const url = new URL(req.url)
 
-    // 处理不同路径跳转
-    let targetOrigin = "https://copilot.microsoft.com";
+    // 设置目标地址（支持多个源）
+    let origin = "https://copilot.microsoft.com"
     if (url.pathname.startsWith("/bundle-cmc/")) {
-      targetOrigin = "https://studiostaticassetsprod.azureedge.net";
+      origin = "https://studiostaticassetsprod.azureedge.net"
     }
 
-    const targetUrl = new URL(url.pathname + url.search, targetOrigin);
+    const targetUrl = origin + url.pathname + url.search
 
-    const newRequest = new Request(targetUrl.href, {
+    const newHeaders = new Headers(req.headers)
+
+    // 修改请求头：设置正确的 Host/Origin/Referer
+    newHeaders.set("Host", new URL(origin).host)
+    newHeaders.set("Origin", origin)
+    newHeaders.set("Referer", origin + "/")
+
+    // ⚠️ 删除 Cloudflare 特有头，防止污染
+    newHeaders.delete("cf-connecting-ip");
+    newHeaders.delete("cf-ipcountry");
+    newHeaders.delete("cf-ray");
+    newHeaders.delete("cf-visitor");
+
+    // 清理转发中的 Accept-Encoding，保留原始压缩数据（如 br）
+    // 否则 Cloudflare Worker 会自动解压后再压，用 JS body 报错
+    newHeaders.delete("Accept-Encoding");
+
+    // 发起代理请求
+    const fetchResponse = await fetch(targetUrl, {
       method: req.method,
-      headers: modifyRequestHeaders(req.headers, targetOrigin),
-      body: ['GET', 'HEAD'].includes(req.method) ? null : req.body,
-      redirect: 'manual',
-    });
+      headers: newHeaders,
+      body: req.method === "GET" || req.method === "HEAD" ? null : req.body,
+      redirect: "manual",
+    })
 
-    let res = await fetch(newRequest);
+    // 响应头做必要修改
+    const responseHeaders = new Headers(fetchResponse.headers)
 
-    // 构建响应
-    res = new Response(res.body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: modifyResponseHeaders(res.headers),
-    });
+    responseHeaders.set('Access-Control-Allow-Origin', '*')
+    responseHeaders.set('Cross-Origin-Embedder-Policy', 'unsafe-none')
+    responseHeaders.set('Cross-Origin-Opener-Policy', 'unsafe-none')
+    responseHeaders.set('Content-Security-Policy', 'default-src * blob: data: filesystem: about: ws: wss:; script-src * blob: data: "unsafe-inline" "unsafe-eval"; connect-src * ws: wss:; img-src * data: blob: filesystem:; style-src * "unsafe-inline"; media-src * data: blob:; font-src * data:; frame-src *;')
 
-    return res;
+    // 拦截 Set-Cookie，去掉不支持的 Domain 字段
+    sanitizeSetCookieHeaders(responseHeaders)
+
+    return new Response(fetchResponse.body, {
+      status: fetchResponse.status,
+      headers: responseHeaders,
+    })
   }
 }
 
-function modifyRequestHeaders(headers, origin) {
-  const newHeaders = new Headers(headers);
-  const host = new URL(origin).host;
-
-  newHeaders.set('Host', host);
-  newHeaders.set('Referer', origin + '/');
-  newHeaders.set('Origin', origin);
-
-  // 删除敏感头
-  newHeaders.delete('cf-connecting-ip');
-  newHeaders.delete('x-forwarded-for');
-  return newHeaders;
-}
-
-function modifyResponseHeaders(headers) {
-  const newHeaders = new Headers(headers);
-
-  // 移除/修改 CSP 限制（防止跨域或脚本执行失败）
-  newHeaders.set('Content-Security-Policy', "");
-  newHeaders.set('Access-Control-Allow-Origin', '*'); // Optional
-
-  // 修复 Set-Cookie 不允许的问题
-  const cookies = headers.getAll ? headers.getAll('Set-Cookie') : [];
-  if (cookies.length > 0) {
-    newHeaders.delete('Set-Cookie');
+/**
+ * 移除 Set-Cookie 中的 Domain，以避免跨域失效
+ */
+function sanitizeSetCookieHeaders(headers) {
+  if (typeof headers.getAll === "function") {
+    const cookies = headers.getAll("Set-Cookie");
+    headers.delete("Set-Cookie");
     cookies.forEach(cookie => {
-      newHeaders.append('Set-Cookie', cookie.replace(/Domain=[^;]+/i, ''));
+      // 移除 Domain，防止失效
+      headers.append("Set-Cookie", cookie.replace(/Domain=[^;]+;?/i, ""));
     });
+  } else if (headers.has("Set-Cookie")) {
+    const cookie = headers.get("Set-Cookie");
+    headers.set("Set-Cookie", cookie.replace(/Domain=[^;]+;?/i, ""));
   }
-
-  return newHeaders;
 }
